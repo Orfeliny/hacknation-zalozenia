@@ -222,7 +222,13 @@
         headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
         body:JSON.stringify({
           contents:[{ role:"user", parts:[{ text:prompt }] }],
-          generationConfig:{ temperature:.5, maxOutputTokens:500 }
+          generationConfig:{
+            temperature:.5,
+            maxOutputTokens:2048,
+            thinkingConfig:{ thinkingBudget:0 },
+            responseMimeType:"application/json",
+            responseSchema:{ type:"ARRAY", items:{ type:"STRING" } }
+          }
         })
       });
       if (!response.ok) throw new Error("Gemini API: " + response.status);
