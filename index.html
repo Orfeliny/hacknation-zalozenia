@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>Walidacja założeń</title>
+  <style>
+    :root { color-scheme: dark; --bg:#111827; --panel:#1f2937; --text:#f9fafb; --muted:#d1d5db; --accent:#22c55e; --border:#374151; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui,-apple-system,sans-serif; }
+    main { max-width:720px; margin:auto; padding:12px 12px calc(24px + env(safe-area-inset-bottom)); }
+    h1 { font-size:1.25rem; margin:8px 0 10px; }
+    h2 { font-size:1rem; margin:0 0 8px; }
+    .questions { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:12px; margin-bottom:12px; }
+    ol { margin:0; padding-left:24px; }
+    li { margin:5px 0; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    button { border:0; border-radius:9px; padding:11px 12px; color:var(--text); background:#374151; font-weight:700; }
+    button.primary { background:#166534; }
+    button.recording { background:#991b1b; }
+    button:disabled { opacity:.55; }
+    .status { color:var(--muted); font-size:.85rem; margin:8px 0 0; min-height:1.3em; }
+    .fields { display:grid; gap:10px; }
+    label { display:grid; gap:5px; color:var(--muted); font-weight:700; }
+    input, textarea { width:100%; border:1px solid var(--border); border-radius:9px; background:#111827; color:var(--text); padding:10px; font:inherit; }
+    textarea { min-height:110px; resize:vertical; }
+    #apiKey { font-family:monospace; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Walidacja hipotez</h1>
+
+  <section class="questions" aria-labelledby="questionsTitle">
+    <h2 id="questionsTitle">Pytania</h2>
+    <ol id="questionList"></ol>
+    <div class="actions">
+      <button id="askNow" type="button">Dopytaj teraz</button>
+      <button id="toggleSpeech" type="button" class="primary">Włącz nasłuch</button>
+      <button id="copyMd" type="button">Kopiuj MD</button>
+    </div>
+    <p id="status" class="status" role="status"></p>
+  </section>
+
+  <section class="fields">
+    <label>Klucz Gemini API
+      <input id="apiKey" type="password" autocomplete="off" placeholder="AI...">
+    </label>
+    <label>Założenia
+      <textarea id="assumptions" placeholder="Problem, użytkownik docelowy i hipotezy H1–H3"></textarea>
+    </label>
+    <label>Rozwiązanie
+      <textarea id="solution" placeholder="Propozycja wartości, kluczowy flow i zakres MVP"></textarea>
+    </label>
+    <label>Notatki / transkrypt
+      <textarea id="notes" placeholder="Notatki lub rozpoznany tekst pojawią się tutaj"></textarea>
+    </label>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const baseQuestions = [
+    "Jaki konkretny problem chcesz przez nas rozwiązany?",
+    "Kto cierpi na ten problem i jak często się z nim spotyka?",
+    "Jak obecnie radzisz sobie z tym problemem?",
+    "Co musiałoby się wydarzyć, abyś uznał rozwiązanie za wartościowe?",
+    "Czy przetestowałbyś rozwiązanie i czy poświęciłbyś mu czas lub pieniądze?"
+  ];
+
+  const STORAGE = "hackathonValidation.v1";
+  const els = {
+    list: document.querySelector("#questionList"),
+    askNow: document.querySelector("#askNow"),
+    toggleSpeech: document.querySelector("#toggleSpeech"),
+    copyMd: document.querySelector("#copyMd"),
+    status: document.querySelector("#status"),
+    apiKey: document.querySelector("#apiKey"),
+    assumptions: document.querySelector("#assumptions"),
+    solution: document.querySelector("#solution"),
+    notes: document.querySelector("#notes")
+  };
+
+  let data = { apiKey:"", assumptions:"", solution:"", notes:"", questions:[...baseQuestions] };
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE));
+    if (saved && typeof saved === "object") data = { ...data, ...saved };
+  } catch (_) {}
+  if (!Array.isArray(data.questions) || !data.questions.length) data.questions = [...baseQuestions];
+  for (const name of ["apiKey","assumptions","solution","notes"]) els[name].value = data[name] || "";
+
+  function save() {
+    data.apiKey = els.apiKey.value;
+    data.assumptions = els.assumptions.value;
+    data.solution = els.solution.value;
+    data.notes = els.notes.value;
+    localStorage.setItem(STORAGE, JSON.stringify(data));
+  }
+
+  function renderQuestions() {
+    els.list.replaceChildren();
+    data.questions.forEach(question => {
+      const li = document.createElement("li");
+      li.textContent = question;
+      els.list.appendChild(li);
+    });
+  }
+
+  function setStatus(message) { els.status.textContent = message; }
+
+  ["apiKey","assumptions","solution","notes"].forEach(name => {
+    els[name].addEventListener("input", save);
+  });
+
+  let SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let listening = false;
+  let restartTimer = null;
+  let restartAttempts = 0;
+
+  function startRecognition() {
+    if (!SpeechRecognition) {
+      setStatus("Web Speech API nie jest dostępne w tej przeglądarce.");
+      return;
+    }
+    if (recognition) return;
+    recognition = new SpeechRecognition();
+    recognition.lang = "pl-PL";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    let interim = "";
+    recognition.onstart = () => {
+      listening = true;
+      restartAttempts = 0;
+      els.toggleSpeech.textContent = "Wyłącz nasłuch";
+      els.toggleSpeech.classList.add("recording");
+      setStatus("Nasłuch włączony.");
+    };
+    recognition.onresult = event => {
+      let finalText = "";
+      interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const text = event.results[i][0].transcript.trim();
+        if (event.results[i].isFinal) finalText += (finalText ? " " : "") + text;
+        else interim = text;
+      }
+      if (finalText) {
+        const separator = els.notes.value && !els.notes.value.endsWith("\n") ? "\n" : "";
+        els.notes.value += separator + finalText;
+        save();
+      }
+      setStatus(interim ? "Rozpoznawanie: " + interim : "Nasłuch włączony.");
+    };
+    recognition.onerror = event => {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        listening = false;
+        setStatus("Brak pozwolenia na mikrofon.");
+        stopRecognition(false);
+      } else {
+        setStatus("Utrata połączenia rozpoznawania mowy. Próba ponownego startu.");
+      }
+    };
+    recognition.onend = () => {
+      recognition = null;
+      if (!listening) {
+        els.toggleSpeech.textContent = "Włącz nasłuch";
+        els.toggleSpeech.classList.remove("recording");
+        return;
+      }
+      restartAttempts++;
+      const delay = Math.min(1000 * Math.pow(2, Math.min(restartAttempts - 1, 4)), 16000);
+      clearTimeout(restartTimer);
+      restartTimer = setTimeout(startRecognition, delay);
+    };
+    try {
+      recognition.start();
+    } catch (_) {
+      recognition = null;
+      setStatus("Nie udało się uruchomić mikrofonu.");
+    }
+  }
+
+  function stopRecognition(updateStatus = true) {
+    listening = false;
+    clearTimeout(restartTimer);
+    if (recognition) recognition.stop();
+    recognition = null;
+    els.toggleSpeech.textContent = "Włącz nasłuch";
+    els.toggleSpeech.classList.remove("recording");
+    if (updateStatus) setStatus("Nasłuch wyłączony.");
+  }
+
+  els.toggleSpeech.addEventListener("click", () => listening ? stopRecognition() : startRecognition());
+
+  async function askGemini() {
+    if (els.askNow.disabled) return;
+    save();
+    const key = els.apiKey.value.trim();
+    if (!key) {
+      setStatus("Dodaj klucz Gemini API, aby generować kolejne pytania.");
+      return;
+    }
+    els.askNow.disabled = true;
+    setStatus("Generowanie kolejnych pytań…");
+    const prompt = [
+      "Jesteś asystentem walidacji produktu. W oparciu o dane poniżej dopisz 2–4 krótkie, konkretne pytania po polsku.",
+      "Nie powtarzaj istniejących pytań. Pytaj o dowody i doświadczenia, nie o opinie marketingowe.",
+      "Zwróć wyłącznie poprawną tablicę JSON z napisami (bez markdown i bez dodatkowego tekstu).",
+      "Założenia:\n" + (els.assumptions.value.trim() || "(brak)"),
+      "Rozwiązanie:\n" + (els.solution.value.trim() || "(brak)"),
+      "Transkrypt/notatki:\n" + (els.notes.value.trim() || "(brak)"),
+      "Istniejące pytania:\n" + data.questions.join("\n")
+    ].join("\n\n");
+
+    try {
+      const response = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+        body:JSON.stringify({
+          contents:[{ role:"user", parts:[{ text:prompt }] }],
+          generationConfig:{ temperature:.5, maxOutputTokens:500 }
+        })
+      });
+      if (!response.ok) throw new Error("Gemini API: " + response.status);
+      const result = await response.json();
+      let text = result.candidates?.[0]?.content?.parts?.map(part => part.text || "").join("") || "";
+      text = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error("Niepoprawna odpowiedź");
+      const existing = new Set(data.questions.map(q => q.toLowerCase()));
+      let added = 0;
+      parsed.forEach(question => {
+        if (typeof question === "string" && question.trim()) {
+          const clean = question.trim().replace(/^[\d.)\]\s]+/, "");
+          if (clean && !existing.has(clean.toLowerCase())) {
+            data.questions.push(clean);
+            existing.add(clean.toLowerCase());
+            added++;
+          }
+        }
+      });
+      save();
+      renderQuestions();
+      setStatus(added ? "Dodano " + added + " nowe pytania." : "Brak nowych pytań.");
+    } catch (error) {
+      setStatus("Nie udało się pobrać pytań: " + error.message);
+    } finally {
+      els.askNow.disabled = false;
+    }
+  }
+
+  els.askNow.addEventListener("click", askGemini);
+  els.copyMd.addEventListener("click", async () => {
+    save();
+    const numbered = data.questions.map((question, i) => (i + 1) + ". " + question).join("\n");
+    const markdown = "## Pytania\n\n" + numbered + "\n\n## Założenia\n\n" +
+      (els.assumptions.value.trim() || "_Brak wpisanych założeń._") + "\n\n## Rozwiązanie\n\n" +
+      (els.solution.value.trim() || "_Brak opisu rozwiązania._") + "\n\n## Notatki / transkrypt\n\n" +
+      (els.notes.value.trim() || "_Brak notatek._") + "\n";
+    try {
+      await navigator.clipboard.writeText(markdown);
+      setStatus("Skopiowano pytania i notatki do schowka.");
+    } catch (_) {
+      const textarea = document.createElement("textarea");
+      textarea.value = markdown;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      textarea.remove();
+      setStatus("Skopiowano pytania i notatki do schowka.");
+    }
+  });
+
+  renderQuestions();
+
+  setInterval(askGemini, 75000);
+})();
+</script>
+</body>
+</html>
